@@ -3,31 +3,9 @@ from geventhttpclient.connectionpool import ConnectionPool, SSLConnectionPool
 from geventhttpclient.response import HTTPSocketPoolResponse
 from geventhttpclient.response import HTTPConnectionClosed
 from geventhttpclient.url import URL
+from geventhttpclient.header import Headers
 from geventhttpclient import __version__
 import gevent.socket
-import gevent.pool
-
-
-class Header(object):
-
-    def __init__(self, key):
-        self._key = key
-        self._lower_key = key.lower()
-
-    def __hash__(self):
-        return hash(self._lower_key)
-
-    def __str__(self):
-        return str(self._key)
-
-    def __eq__(self, other):
-        return str(other).lower() == self._lower_key
-
-    def __ne__(self, other):
-        return not self.__eq__(other)
-
-    def __repr__(self):
-        return "Header(%s)" % self._key
 
 
 class HTTPClient(object):
@@ -36,19 +14,19 @@ class HTTPClient(object):
     HTTP_10 = 'HTTP/1.0'
 
     BLOCK_SIZE = 1024 * 4 # 4KB
-    CONNECTION_TIMEOUT = 10
-    NETWORK_TIMEOUT = 10
 
-    DEFAULT_HEADERS = {
-        Header('User-Agent'): 'python/gevent-http-client-' + __version__
-    }
+    DEFAULT_HEADERS = Headers({
+        'User-Agent': 'python/gevent-http-client-' + __version__
+    })
 
-    @staticmethod
-    def from_url(url, **kw):
+    @classmethod
+    def from_url(cls, url, **kw):
         if not isinstance(url, URL):
             url = URL(url)
         enable_ssl = url.scheme == 'https'
-        return HTTPClient(url.host, port=url.port, ssl=enable_ssl, **kw)
+        if not enable_ssl:
+            kw.pop('ssl_options', None)
+        return cls(url.host, port=url.port, ssl=enable_ssl, **kw)
 
     def __init__(self, host, port=None, headers={},
             block_size=BLOCK_SIZE,
@@ -56,14 +34,15 @@ class HTTPClient(object):
             network_timeout=ConnectionPool.DEFAULT_NETWORK_TIMEOUT,
             disable_ipv6=False,
             concurrency=1, ssl_options=None, ssl=False,
-            proxy_host=None, proxy_port=None, version=HTTP_11):
+            proxy_host=None, proxy_port=None, version=HTTP_11, 
+            headers_type=Headers):
         self.host = host
         self.port = port
         connection_host = self.host
         connection_port = self.port
         if proxy_host is not None:
             assert proxy_port is not None, \
-                'you have to provide proxy_port if you have set proxy_host'
+                'you have to provide proxy_port if you set proxy_host'
             self.use_proxy = True
             connection_host = proxy_host
             connection_port = proxy_port
@@ -90,10 +69,10 @@ class HTTPClient(object):
                 connection_timeout=connection_timeout,
                 disable_ipv6=disable_ipv6)
         self.version = version
-        self.default_headers = self.DEFAULT_HEADERS.copy()
-        for field, value in headers.iteritems():
-            self.default_headers[Header(field)] = value
-
+        self.headers_type = headers_type
+        self.default_headers = headers_type()
+        self.default_headers.update(self.DEFAULT_HEADERS)
+        self.default_headers.update(headers)
         self.block_size = block_size
         self._base_url_string = str(self.get_base_url())
 
@@ -108,16 +87,16 @@ class HTTPClient(object):
         self._connection_pool.close()
 
     def _build_request(self, method, request_uri, body="", headers={}):
-        header_fields = self.default_headers.copy()
-        for field, value in headers.iteritems():
-            header_fields[Header(field)] = value
-        if self.version == self.HTTP_11 and 'host' not in header_fields:
+        header_fields = self.headers_type()
+        header_fields.update(self.default_headers)
+        header_fields.update(headers)
+        if self.version == self.HTTP_11 and 'Host' not in header_fields:
             host_port = self.host
             if self.port not in (80, 443):
                 host_port += ":" + str(self.port)
-            header_fields[Header('Host')] = host_port
-        if body:
-            header_fields[Header('Content-Length')] = str(len(body))
+            header_fields['Host'] = host_port
+        if body and 'Content-Length' not in header_fields:
+            header_fields['Content-Length'] = len(body)
 
         request_url = request_uri
         if self.use_proxy:
@@ -125,10 +104,18 @@ class HTTPClient(object):
             if request_uri.startswith('/'):
                 base_url = base_url[:-1]
             request_url = base_url + request_url
+        elif not request_url.startswith(('/', 'http')):
+            request_url = '/' + request_url
+        elif request_url.startswith('http'):
+            if request_url.startswith(self._base_url_string):
+                request_url = request_url[len(self._base_url_string)-1:]
+            else:
+                raise ValueError("Invalid host in URL")
+            
         request = method + " " + request_url + " " + self.version + "\r\n"
 
         for field, value in header_fields.iteritems():
-            request += str(field) + ': ' + value + "\r\n"
+            request += field + ': ' + str(value) + "\r\n"
         request += "\r\n"
         if body:
             request += body
@@ -140,11 +127,11 @@ class HTTPClient(object):
 
         attempts_left = self._connection_pool.size + 1
 
-        while True:
+        while 1:
             sock = self._connection_pool.get_socket()
             try:
                 sock.sendall(request)
-            except gevent.socket.error as e:
+            except gevent.socket.error as e: #@UndefinedVariable
                 self._connection_pool.release_socket(sock)
                 if e.errno == errno.ECONNRESET and attempts_left > 0:
                     attempts_left -= 1
@@ -152,14 +139,17 @@ class HTTPClient(object):
                 raise e
 
             try:
-                return HTTPSocketPoolResponse(sock, self._connection_pool,
-                    block_size=self.block_size, method=method.upper())
+                ret = HTTPSocketPoolResponse(sock, self._connection_pool,
+                    block_size=self.block_size, method=method.upper(), headers_type=self.headers_type)
             except HTTPConnectionClosed as e:
                 # connection is released by the response itself
                 if attempts_left > 0:
                     attempts_left -= 1
                     continue
                 raise e
+            else:
+                ret._sent_request = request
+                return ret
 
     def get(self, request_uri, headers={}):
         return self.request('GET', request_uri, headers=headers)
@@ -172,5 +162,27 @@ class HTTPClient(object):
 
     def delete(self, request_uri, body=u'', headers={}):
         return self.request('DELETE', request_uri, body=body, headers=headers)
+    
+    
+class HTTPClientPool(object):
+    """ Factory for maintaining a bunch of clients, one per host:port """
+    # TODO: Add some housekeeping and cleanup logic
+    
+    def __init__(self, **kwargs):
+        self.clients = dict()
+        self.client_args = kwargs
 
-
+    def get_client(self, url):
+        if not isinstance(url, URL):
+            url = URL(url)
+        client_key = url.host, url.port
+        try: 
+            return self.clients[client_key]
+        except KeyError:
+            client = HTTPClient.from_url(url, **self.client_args)
+            self.clients[client_key] = client
+            return client
+        
+    def close(self):
+        for client in self.clients.values():
+            client.close()

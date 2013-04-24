@@ -35,6 +35,7 @@ class URL(object):
     }
 
     __slots__ = ('scheme', 'host', 'port', 'path', 'query', 'fragment')
+    quoting_safe = ''
 
     def __init__(self, url=None):
         if url is not None:
@@ -92,10 +93,10 @@ class URL(object):
             if isinstance(value, list):
                 for item in value:
                     params.append("%s=%s" % (
-                        quote_plus(key), quote_plus(str(item))))
+                        quote_plus(key), quote_plus(str(item), safe=self.quoting_safe)))
             else:
                 params.append("%s=%s" % (
-                    quote_plus(key), quote_plus(str(value))))
+                    quote_plus(key), quote_plus(str(value), safe=self.quoting_safe)))
         if params:
             return "&".join(params)
         return ''
@@ -129,4 +130,15 @@ class URL(object):
         self.path += value
         return self.path
 
-
+    def redirect(self, other):
+        other = type(self)(other)
+        if not other.host:
+            other.scheme = self.scheme
+            other.host = self.host
+            other.port = self.port
+        if not other.path.startswith('/'):
+            if self.path.endswith('/'):
+                other.path = self.path + other.path
+            else:
+                other.path = self.path.rsplit('/', 1)[0] + '/' + other.path
+        return other

@@ -8,6 +8,12 @@ with warnings.catch_warnings():
     warnings.filterwarnings("ignore",category=DeprecationWarning)
     import gevent.coros
 
+try:
+    from gevent import lock
+except ImportError:
+    # gevent < 1.0b2
+    from gevent import coros as lock
+
 
 CA_CERTS = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "cacert.pem")
@@ -32,7 +38,7 @@ class ConnectionPool(object):
         self._closed = False
         self._host = host
         self._port = port
-        self._semaphore = gevent.coros.BoundedSemaphore(size)
+        self._semaphore = lock.BoundedSemaphore(size)
         self._socket_queue = gevent.queue.LifoQueue(size)
 
         self.connection_timeout = connection_timeout
@@ -45,13 +51,13 @@ class ConnectionPool(object):
         """
         family = 0
         if self.disable_ipv6:
-            family = gevent.socket.AF_INET
+            family = gevent.socket.AF_INET #@UndefinedVariable
 
         info = gevent.socket.getaddrinfo(self._host, self._port,
-                family, 0, gevent.socket.SOL_TCP)
+                family, 0, gevent.socket.SOL_TCP) #@UndefinedVariable
 
         # family, socktype, proto, canonname, sockaddr = info[0]
-        return info[0]
+        return info
 
     def close(self):
         self._closed = True
@@ -75,12 +81,22 @@ class ConnectionPool(object):
         """ might be overriden and super for wrapping into a ssl socket
             or set tcp/socket options
         """
-        sock_info = self._resolve()
-        sock = self._create_tcp_socket(*sock_info[:3])
-        sock.settimeout(self.connection_timeout)
-        sock.connect(sock_info[-1])
-        sock.settimeout(self.network_timeout)
-        return sock
+        sock_infos = self._resolve()
+        first_error = None
+        for sock_info in sock_infos:
+            try:
+                sock = self._create_tcp_socket(*sock_info[:3])
+                sock.settimeout(self.connection_timeout)
+                sock.connect(sock_info[-1])
+                sock.settimeout(self.network_timeout)
+                return sock
+            except IOError as e:
+                if not first_error:
+                    first_error = e
+        if first_error:
+            raise first_error
+        else:
+            raise RuntimeError("Cannot resolve %s:%s" % (self._host, self._port))
 
     def get_socket(self):
         """ get a socket from the pool. This blocks until one is available.
@@ -124,7 +140,7 @@ class SSLConnectionPool(ConnectionPool):
 
     default_options = {
         'ca_certs': CA_CERTS,
-        'cert_reqs': gevent.ssl.CERT_REQUIRED
+        'cert_reqs': gevent.ssl.CERT_REQUIRED #@UndefinedVariable
     }
 
     def __init__(self, host, port, **kw):
