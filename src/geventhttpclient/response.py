@@ -1,5 +1,6 @@
 import errno
-from geventhttpclient._parser import HTTPResponseParser, HTTPParseError
+from geventhttpclient._parser import HTTPResponseParser, HTTPParseError #@UnresolvedImport
+from geventhttpclient.header import Headers
 import gevent.socket
 
 
@@ -13,15 +14,19 @@ class HTTPConnectionClosed(HTTPParseError):
     pass
 
 
+class HTTPProtocolViolationError(HTTPParseError):
+    pass
+
+
 class HTTPResponse(HTTPResponseParser):
 
-    def __init__(self, method='GET'):
+    def __init__(self, method='GET', headers_type=Headers):
         super(HTTPResponse, self).__init__()
         self.method = method.upper()
         self.headers_complete = False
         self.message_begun = False
         self.message_complete = False
-        self._headers_index = {}
+        self._headers_index = headers_type()
         self._header_state = HEADER_STATE_INIT
         self._current_header_field = None
         self._current_header_value = None
@@ -29,17 +34,20 @@ class HTTPResponse(HTTPResponseParser):
         self._body_buffer = bytearray()
 
     def __getitem__(self, key):
-        return self._headers_index[key.lower()]
+        return self._headers_index[key]
 
     def get(self, key, default=None):
-        return self._headers_index.get(key.lower(), default)
+        return self._headers_index.get(key, default)
 
     def iteritems(self):
-        for field in self._headers_index.keys():
-            yield (field, self._headers_index[field])
+        return self._headers_index.iteritems()
 
     def items(self):
-        return list(self.iteritems())
+        return self._headers_index.items()
+    
+    def info(self):
+        """ Basic cookielib compatibility """
+        return self._headers_index
 
     def should_keep_alive(self):
         """ return if the headers instruct to keep the connection
@@ -78,8 +86,7 @@ class HTTPResponse(HTTPResponseParser):
 
     def _on_message_begin(self):
         if self.message_begun:
-            # stop the parser we have a new response
-            return True
+            raise HTTPProtocolViolationError("A new response began before end of %r." % self)
         self.message_begun = True
 
     def _on_message_complete(self):
@@ -90,7 +97,7 @@ class HTTPResponse(HTTPResponseParser):
         self._header_state = HEADER_STATE_DONE
         self.headers_complete = True
 
-        if self.method in ('HEAD',):
+        if self.method == 'HEAD':
             return True # SKIP BODY
         return False
 
@@ -114,8 +121,8 @@ class HTTPResponse(HTTPResponseParser):
 
     def _flush_header(self):
         if self._current_header_field is not None:
-            self._headers_index[self._current_header_field.lower()] = \
-                self._current_header_value
+            self._headers_index.setdefault(self._current_header_field, 
+                                           self._current_header_value)
             self._header_position += 1
             self._current_header_field = None
             self._current_header_value = None
@@ -123,14 +130,20 @@ class HTTPResponse(HTTPResponseParser):
     def _on_body(self, buf):
         self._body_buffer += buf
 
+    def __repr__(self):
+        return "<{klass} status={status} headers={headers}>".format(
+            klass=self.__class__.__name__,
+            status=self.status_code,
+            headers=dict(self.headers))
+
 
 class HTTPSocketResponse(HTTPResponse):
 
     DEFAULT_BLOCK_SIZE = 1024 * 4 # 4KB
 
     def __init__(self, sock, block_size=DEFAULT_BLOCK_SIZE,
-            method='GET'):
-        super(HTTPSocketResponse, self).__init__(method=method)
+            method='GET', **kw):
+        super(HTTPSocketResponse, self).__init__(method=method, **kw)
         self._sock = sock
         self.block_size = block_size
         self._read_headers()
@@ -163,7 +176,7 @@ class HTTPSocketResponse(HTTPResponse):
                         raise HTTPParseError('connection closed before'
                                             ' end of the headers')
                     start = False
-                except gevent.socket.error as e:
+                except gevent.socket.error as e: #@UndefinedVariable
                     if e.errno == errno.ECONNRESET:
                         if start:
                             raise HTTPConnectionClosed(
@@ -250,6 +263,12 @@ class HTTPSocketResponse(HTTPResponse):
         super(HTTPSocketResponse, self)._on_message_complete()
         self.release()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.release()
+
 
 class HTTPSocketPoolResponse(HTTPSocketResponse):
 
@@ -271,5 +290,4 @@ class HTTPSocketPoolResponse(HTTPSocketResponse):
     def __del__(self):
         if self._sock is not None:
             self._pool.release_socket(self._sock)
-
 
